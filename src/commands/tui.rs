@@ -527,6 +527,15 @@ async fn run_loop(
                     Focus::Sidebar
                 };
             }
+            (KeyCode::Char('o'), _) => {
+                if let Some(id) = app.selected_gist_id() {
+                    if let Some(gist) = app.gists.iter().find(|g| g.id == id) {
+                        let _ = std::process::Command::new("open")
+                            .arg(&gist.html_url)
+                            .spawn();
+                    }
+                }
+            }
             (KeyCode::Char('e'), _) => {
                 edit_gist_via_editor(terminal, app, client).await?;
             }
@@ -721,7 +730,7 @@ fn render_status(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     let text = if !app.status.is_empty() {
         app.status.clone()
     } else {
-        " j/k: navigate  h/l: collapse/expand  ^h/^l: switch pane  n: new  d: delete  r: refresh  q: quit".to_string()
+        " j/k: navigate  h/l: collapse/expand  tab: switch pane  o: open  n: new  e: edit  d: delete  r: refresh  q: quit".to_string()
     };
 
     let style = if app.confirm_delete.is_some() {

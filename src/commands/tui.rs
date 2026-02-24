@@ -91,6 +91,7 @@ impl App {
         self.gists = gists;
         self.loading = false;
         self.rebuild_entries();
+        self.preview_selected();
     }
 
     fn rebuild_entries(&mut self) {
@@ -181,7 +182,6 @@ impl App {
         // Need to fetch full gist detail
         self.pending_file = Some((gist_id.to_string(), filename.to_string()));
         self.status = "Fetching content...".into();
-        self.focus = Focus::Content;
     }
 
     fn show_content(&mut self, filename: &str, content: &str) {
@@ -190,7 +190,6 @@ impl App {
         self.file_content = Some((filename.to_string(), content.to_string()));
         self.content_scroll = 0;
         self.content_hscroll = 0;
-        self.focus = Focus::Content;
         self.pending_file = None;
     }
 
@@ -260,6 +259,7 @@ impl App {
         }
         if self.selected > 0 {
             self.selected -= 1;
+            self.preview_selected();
         }
     }
 
@@ -270,7 +270,33 @@ impl App {
         }
         if self.selected + 1 < self.entries.len() {
             self.selected += 1;
+            self.preview_selected();
         }
+    }
+
+    /// Show content for the currently selected entry without changing focus.
+    fn preview_selected(&mut self) {
+        let Some(entry) = self.entries.get(self.selected) else {
+            return;
+        };
+
+        let (gist_id, filename) = match &entry.kind {
+            EntryKind::File { gist_id, filename } => (gist_id.clone(), filename.clone()),
+            EntryKind::Gist { id, .. } => {
+                // Preview the first file of the gist
+                let Some(gist) = self.gists.iter().find(|g| g.id == *id) else {
+                    return;
+                };
+                let mut filenames: Vec<&String> = gist.files.keys().collect();
+                filenames.sort();
+                let Some(first) = filenames.first() else {
+                    return;
+                };
+                (id.clone(), first.to_string())
+            }
+        };
+
+        self.select_file(&gist_id, &filename);
     }
 
     fn selected_gist_id(&self) -> Option<String> {
@@ -494,7 +520,7 @@ async fn run_loop(
             (KeyCode::Char('l'), KeyModifiers::CONTROL) => {
                 app.focus = Focus::Content;
             }
-            (KeyCode::Tab, _) => {
+            (KeyCode::Tab, _) | (KeyCode::BackTab, _) => {
                 app.focus = if app.focus == Focus::Sidebar {
                     Focus::Content
                 } else {

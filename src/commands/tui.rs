@@ -1,8 +1,10 @@
 use std::collections::HashSet;
-use std::io;
+use std::io::{self, Write};
+use std::path::PathBuf;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
+use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -12,6 +14,7 @@ use ratatui::Terminal;
 use syntect::highlighting::{self, ThemeSet};
 use syntect::parsing::SyntaxSet;
 use tokio::sync::mpsc;
+use tui_term::widget::PseudoTerminal;
 
 use crate::api::{self, Gist};
 use crate::error::CliError;
@@ -42,6 +45,18 @@ enum Focus {
     Content,
 }
 
+struct PtyEditor {
+    master: Box<dyn MasterPty + Send>,
+    pty_rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    writer: Box<dyn Write + Send>,
+    parser: vt100::Parser,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    filename: String,
+    gist_id: String,
+    tmp_path: PathBuf,
+    original_content: String,
+}
+
 struct App {
     gists: Vec<Gist>,
     entries: Vec<Entry>,
@@ -61,6 +76,8 @@ struct App {
     fetched_detail: HashSet<String>,
     /// (gist_id, filename) waiting for detail fetch to complete
     pending_file: Option<(String, String)>,
+    /// Embedded PTY editor state
+    pty_editor: Option<PtyEditor>,
 }
 
 impl App {
@@ -84,6 +101,7 @@ impl App {
             theme,
             fetched_detail: HashSet::new(),
             pending_file: None,
+            pty_editor: None,
         }
     }
 
@@ -347,6 +365,61 @@ impl App {
     }
 }
 
+/// Convert a crossterm KeyEvent into raw bytes suitable for writing to a PTY.
+fn key_event_to_bytes(key: &crossterm::event::KeyEvent) -> Vec<u8> {
+    let mods = key.modifiers;
+    match key.code {
+        KeyCode::Char(c) => {
+            if mods.contains(KeyModifiers::CONTROL) {
+                // Ctrl+a = 0x01, Ctrl+z = 0x1a
+                let byte = (c.to_ascii_lowercase() as u8).wrapping_sub(b'a').wrapping_add(1);
+                if byte <= 26 {
+                    return vec![byte];
+                }
+            }
+            if mods.contains(KeyModifiers::ALT) {
+                let mut bytes = vec![0x1b];
+                let mut buf = [0u8; 4];
+                bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                return bytes;
+            }
+            let mut buf = [0u8; 4];
+            c.encode_utf8(&mut buf).as_bytes().to_vec()
+        }
+        KeyCode::Enter => vec![b'\r'],
+        KeyCode::Backspace => vec![0x7f],
+        KeyCode::Esc => vec![0x1b],
+        KeyCode::Tab => vec![b'\t'],
+        KeyCode::BackTab => vec![0x1b, b'[', b'Z'],
+        KeyCode::Up => vec![0x1b, b'[', b'A'],
+        KeyCode::Down => vec![0x1b, b'[', b'B'],
+        KeyCode::Right => vec![0x1b, b'[', b'C'],
+        KeyCode::Left => vec![0x1b, b'[', b'D'],
+        KeyCode::Home => vec![0x1b, b'[', b'H'],
+        KeyCode::End => vec![0x1b, b'[', b'F'],
+        KeyCode::PageUp => vec![0x1b, b'[', b'5', b'~'],
+        KeyCode::PageDown => vec![0x1b, b'[', b'6', b'~'],
+        KeyCode::Insert => vec![0x1b, b'[', b'2', b'~'],
+        KeyCode::Delete => vec![0x1b, b'[', b'3', b'~'],
+        KeyCode::F(n) => match n {
+            1 => vec![0x1b, b'O', b'P'],
+            2 => vec![0x1b, b'O', b'Q'],
+            3 => vec![0x1b, b'O', b'R'],
+            4 => vec![0x1b, b'O', b'S'],
+            5 => vec![0x1b, b'[', b'1', b'5', b'~'],
+            6 => vec![0x1b, b'[', b'1', b'7', b'~'],
+            7 => vec![0x1b, b'[', b'1', b'8', b'~'],
+            8 => vec![0x1b, b'[', b'1', b'9', b'~'],
+            9 => vec![0x1b, b'[', b'2', b'0', b'~'],
+            10 => vec![0x1b, b'[', b'2', b'1', b'~'],
+            11 => vec![0x1b, b'[', b'2', b'3', b'~'],
+            12 => vec![0x1b, b'[', b'2', b'4', b'~'],
+            _ => vec![],
+        },
+        _ => vec![],
+    }
+}
+
 pub async fn execute(client: &reqwest::Client) -> Result<(), CliError> {
     let mut app = App::new();
 
@@ -388,6 +461,144 @@ pub async fn execute(client: &reqwest::Client) -> Result<(), CliError> {
     result
 }
 
+/// Compute the content pane area (the inner area where the editor renders).
+fn content_pane_size(terminal_size: Rect) -> (u16, u16) {
+    let [main_area, _] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(terminal_size);
+    let [_, content_area] =
+        Layout::horizontal([Constraint::Length(40), Constraint::Fill(1)]).areas(main_area);
+    // Account for the block border (1 on each side)
+    let rows = content_area.height.saturating_sub(2);
+    let cols = content_area.width.saturating_sub(2);
+    (rows, cols)
+}
+
+fn start_pty_editor(app: &mut App, content_area: Rect) -> Result<(), CliError> {
+    let Some((gist_id, filename)) = app.resolve_edit_target() else {
+        app.status = "No file selected to edit.".into();
+        return Ok(());
+    };
+
+    let editor = std::env::var("EDITOR")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| CliError::api("EDITOR is not set"))?;
+
+    // Get current content
+    let content = app
+        .gists
+        .iter()
+        .find(|g| g.id == gist_id)
+        .and_then(|g| g.files.get(&filename))
+        .and_then(|f| f.content.clone())
+        .unwrap_or_default();
+
+    // Write to temp file preserving extension for editor syntax highlighting
+    let ext = std::path::Path::new(&filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("txt");
+    let tmp_path = std::env::temp_dir().join(format!("gist-edit-{}.{ext}", std::process::id()));
+    std::fs::write(&tmp_path, &content).map_err(|e| CliError::Io {
+        context: "failed to create temp file".into(),
+        source: e,
+    })?;
+
+    // Size the pty to the content pane (minus block borders)
+    let rows = content_area.height.saturating_sub(2).max(1);
+    let cols = content_area.width.saturating_sub(2).max(1);
+
+    let pty_system = native_pty_system();
+    let pty_pair = pty_system
+        .openpty(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|e| CliError::api(format!("failed to open pty: {e}")))?;
+
+    let mut cmd = CommandBuilder::new(&editor);
+    cmd.arg(&tmp_path);
+
+    let child = pty_pair
+        .slave
+        .spawn_command(cmd)
+        .map_err(|e| CliError::api(format!("failed to spawn editor: {e}")))?;
+
+    // Drop the slave — we only interact through the master
+    drop(pty_pair.slave);
+
+    let mut reader = pty_pair
+        .master
+        .try_clone_reader()
+        .map_err(|e| CliError::api(format!("failed to get pty reader: {e}")))?;
+    let writer = pty_pair
+        .master
+        .take_writer()
+        .map_err(|e| CliError::api(format!("failed to get pty writer: {e}")))?;
+
+    // Spawn a thread to read pty output and send it through a channel
+    let (pty_tx, pty_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if pty_tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let parser = vt100::Parser::new(rows, cols, 0);
+
+    app.pty_editor = Some(PtyEditor {
+        master: pty_pair.master,
+        pty_rx,
+        writer,
+        parser,
+        child,
+        filename,
+        gist_id,
+        tmp_path,
+        original_content: content,
+    });
+
+    Ok(())
+}
+
+async fn finish_pty_editor(app: &mut App, client: &reqwest::Client) -> Result<(), CliError> {
+    let editor = app.pty_editor.take().expect("no pty editor to finish");
+
+    let new_content = std::fs::read_to_string(&editor.tmp_path).map_err(|e| CliError::Io {
+        context: "failed to read temp file".into(),
+        source: e,
+    })?;
+    let _ = std::fs::remove_file(&editor.tmp_path);
+
+    if new_content == editor.original_content {
+        app.status = "No changes.".into();
+        return Ok(());
+    }
+
+    app.status = "Saving...".into();
+    let updated =
+        api::update_gist_file(client, &editor.gist_id, &editor.filename, &new_content).await?;
+    app.fetched_detail.insert(editor.gist_id.clone());
+    if let Some(existing) = app.gists.iter_mut().find(|g| g.id == editor.gist_id) {
+        *existing = updated;
+    }
+
+    app.show_content(&editor.filename, &new_content);
+    app.status = "Saved.".into();
+    Ok(())
+}
+
 async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stderr>>,
     app: &mut App,
@@ -395,6 +606,8 @@ async fn run_loop(
     mut bg_rx: mpsc::Receiver<BgMessage>,
     bg_tx: mpsc::Sender<BgMessage>,
 ) -> Result<(), CliError> {
+    let mut last_content_area = Rect::default();
+
     loop {
         // Check for background messages
         while let Ok(msg) = bg_rx.try_recv() {
@@ -433,8 +646,31 @@ async fn run_loop(
             }
         }
 
+        // Read pty output if editor is active
+        if let Some(ref mut pty) = app.pty_editor {
+            // Drain all available output from the reader thread
+            while let Ok(bytes) = pty.pty_rx.try_recv() {
+                pty.parser.process(&bytes);
+            }
+
+            // Check if child exited
+            if let Some(_status) = pty.child.try_wait().ok().flatten() {
+                finish_pty_editor(app, client).await?;
+            }
+        }
+
         terminal
-            .draw(|frame| render(frame, app))
+            .draw(|frame| {
+                render(frame, app);
+                // Capture the content area for resize handling
+                let area = frame.area();
+                let [main_area, _] =
+                    Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
+                let [_, content_area] =
+                    Layout::horizontal([Constraint::Length(40), Constraint::Fill(1)])
+                        .areas(main_area);
+                last_content_area = content_area;
+            })
             .map_err(|e| CliError::Io {
                 context: "failed to draw frame".into(),
                 source: e,
@@ -443,7 +679,7 @@ async fn run_loop(
         // Yield to let spawned tasks (e.g. background gist loading) run
         tokio::task::yield_now().await;
 
-        if !event::poll(std::time::Duration::from_millis(50)).map_err(|e| CliError::Io {
+        if !event::poll(std::time::Duration::from_millis(16)).map_err(|e| CliError::Io {
             context: "failed to poll events".into(),
             source: e,
         })? {
@@ -455,11 +691,39 @@ async fn run_loop(
             source: e,
         })?;
 
+        // Handle resize events for the pty editor
+        if let Event::Resize(_, _) = &ev {
+            if let Some(ref mut pty) = app.pty_editor {
+                let (rows, cols) = content_pane_size(terminal.get_frame().area());
+                let rows = rows.max(1);
+                let cols = cols.max(1);
+                let _ = pty.master.resize(PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                });
+                pty.parser.screen_mut().set_size(rows, cols);
+            }
+        }
+
         let Event::Key(key) = ev else {
             continue;
         };
 
         if key.kind != KeyEventKind::Press {
+            continue;
+        }
+
+        // If pty editor is active, forward all keys to it
+        if app.pty_editor.is_some() {
+            let bytes = key_event_to_bytes(&key);
+            if !bytes.is_empty() {
+                if let Some(ref mut pty) = app.pty_editor {
+                    let _ = pty.writer.write_all(&bytes);
+                    let _ = pty.writer.flush();
+                }
+            }
             continue;
         }
 
@@ -537,7 +801,7 @@ async fn run_loop(
                 }
             }
             (KeyCode::Char('e'), _) => {
-                edit_gist_via_editor(terminal, app, client).await?;
+                start_pty_editor(app, last_content_area)?;
             }
             (KeyCode::Char('n'), _) => {
                 create_gist_via_editor(terminal, app, client).await?;
@@ -653,6 +917,18 @@ fn render_sidebar(frame: &mut ratatui::Frame, app: &App, area: Rect) {
 }
 
 fn render_content(frame: &mut ratatui::Frame, app: &App, area: Rect) {
+    // If pty editor is active, render the terminal widget
+    if let Some(ref pty) = app.pty_editor {
+        let block = Block::default()
+            .title(format!(" {} (editing) ", pty.filename))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow));
+
+        let pseudo_term = PseudoTerminal::new(pty.parser.screen()).block(block);
+        frame.render_widget(pseudo_term, area);
+        return;
+    }
+
     let block = Block::default()
         .title(match &app.file_content {
             Some((filename, _)) => format!(" {filename} "),
@@ -727,13 +1003,19 @@ fn highlight_content(
 }
 
 fn render_status(frame: &mut ratatui::Frame, app: &App, area: Rect) {
-    let text = if !app.status.is_empty() {
+    let text = if app.pty_editor.is_some() {
+        " editing — save & quit from your editor to return".to_string()
+    } else if !app.status.is_empty() {
         app.status.clone()
     } else {
         " j/k: navigate  h/l: collapse/expand  tab: switch pane  o: open  n: new  e: edit  d: delete  r: refresh  q: quit".to_string()
     };
 
-    let style = if app.confirm_delete.is_some() {
+    let style = if app.pty_editor.is_some() {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else if app.confirm_delete.is_some() {
         Style::default()
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD)
@@ -846,119 +1128,3 @@ async fn create_gist_via_editor(
     Ok(())
 }
 
-async fn edit_gist_via_editor(
-    terminal: &mut Terminal<CrosstermBackend<io::Stderr>>,
-    app: &mut App,
-    client: &reqwest::Client,
-) -> Result<(), CliError> {
-    let Some((gist_id, filename)) = app.resolve_edit_target() else {
-        app.status = "No file selected to edit.".into();
-        return Ok(());
-    };
-
-    let editor = std::env::var("EDITOR")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .ok_or_else(|| CliError::api("EDITOR is not set"))?;
-
-    // Get current content — may need to fetch it first
-    let current_content = app
-        .gists
-        .iter()
-        .find(|g| g.id == gist_id)
-        .and_then(|g| g.files.get(&filename))
-        .and_then(|f| f.content.clone());
-
-    let content = if let Some(c) = current_content {
-        c
-    } else {
-        // Fetch full gist to get content
-        let full = api::get_gist(client, &gist_id).await?;
-        let c = full
-            .files
-            .get(&filename)
-            .and_then(|f| f.content.clone())
-            .unwrap_or_default();
-        // Store it
-        if let Some(existing) = app.gists.iter_mut().find(|g| g.id == gist_id) {
-            *existing = full;
-        }
-        app.fetched_detail.insert(gist_id.clone());
-        c
-    };
-
-    // Leave TUI
-    crossterm::execute!(io::stderr(), LeaveAlternateScreen).ok();
-    terminal::disable_raw_mode().ok();
-
-    // Use the original extension so EDITOR gets syntax highlighting
-    let ext = std::path::Path::new(&filename)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("txt");
-    let tmp = std::env::temp_dir().join(format!("gist-edit-{}.{ext}", std::process::id()));
-
-    std::fs::write(&tmp, &content).map_err(|e| CliError::Io {
-        context: "failed to create temp file".into(),
-        source: e,
-    })?;
-
-    let status = std::process::Command::new(&editor)
-        .arg(&tmp)
-        .status()
-        .map_err(|e| CliError::Io {
-            context: format!("failed to launch editor ({editor})"),
-            source: e,
-        })?;
-
-    // Re-enter TUI
-    terminal::enable_raw_mode().map_err(|e| CliError::Io {
-        context: "failed to re-enable raw mode".into(),
-        source: e,
-    })?;
-    crossterm::execute!(io::stderr(), EnterAlternateScreen).map_err(|e| CliError::Io {
-        context: "failed to re-enter alternate screen".into(),
-        source: e,
-    })?;
-    terminal.clear().map_err(|e| CliError::Io {
-        context: "failed to clear terminal".into(),
-        source: e,
-    })?;
-
-    if !status.success() {
-        let _ = std::fs::remove_file(&tmp);
-        app.status = "Editor exited without saving.".into();
-        return Ok(());
-    }
-
-    let new_content = std::fs::read_to_string(&tmp).map_err(|e| CliError::Io {
-        context: "failed to read temp file".into(),
-        source: e,
-    })?;
-    let _ = std::fs::remove_file(&tmp);
-
-    if new_content == content {
-        app.status = "No changes.".into();
-        return Ok(());
-    }
-
-    app.status = "Saving...".into();
-    terminal
-        .draw(|frame| render(frame, app))
-        .map_err(|e| CliError::Io {
-            context: "failed to draw frame".into(),
-            source: e,
-        })?;
-
-    let updated = api::update_gist_file(client, &gist_id, &filename, &new_content).await?;
-    app.fetched_detail.insert(gist_id.clone());
-    if let Some(existing) = app.gists.iter_mut().find(|g| g.id == gist_id) {
-        *existing = updated;
-    }
-
-    // Refresh the content pane if we were viewing this file
-    app.show_content(&filename, &new_content);
-    app.status = "Saved.".into();
-
-    Ok(())
-}

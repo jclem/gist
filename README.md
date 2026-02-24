@@ -4,10 +4,10 @@ A fast GitHub Gist CLI with an interactive TUI, written in Rust.
 
 ## Setup
 
-Set a GitHub personal access token with the `gist` scope:
+Authenticate with the [GitHub CLI](https://cli.github.com/):
 
 ```sh
-export GH_GIST_TOKEN="ghp_..."
+gh auth login
 ```
 
 ## Install

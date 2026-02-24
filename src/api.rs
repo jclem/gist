@@ -13,13 +13,25 @@ pub fn new_client() -> reqwest::Client {
 }
 
 fn resolve_token() -> Result<String, CliError> {
+    if let Ok(output) = std::process::Command::new("gh")
+        .args(["auth", "token"])
+        .output()
+    {
+        if output.status.success() {
+            let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !token.is_empty() {
+                return Ok(token);
+            }
+        }
+    }
+
     std::env::var("GH_GIST_TOKEN")
         .ok()
         .filter(|v| !v.is_empty())
         .ok_or_else(|| {
             CliError::auth_with_hint(
                 "no GitHub token found",
-                "set GH_GIST_TOKEN in your environment",
+                "authenticate with `gh auth login` or set GH_GIST_TOKEN",
             )
         })
 }
@@ -34,7 +46,7 @@ async fn check_status(resp: reqwest::Response, context: &str) -> Result<reqwest:
     {
         return Err(CliError::auth_with_hint(
             format!("{context}: unauthorized"),
-            "check that GH_GIST_TOKEN is valid and has the gist scope",
+            "check that your `gh` token or GH_GIST_TOKEN is valid and has the gist scope",
         ));
     }
 

@@ -42,6 +42,8 @@ enum Command {
         /// Gist URL or ID
         url: String,
     },
+    /// Interactive TUI for browsing gists
+    Tui,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -52,6 +54,7 @@ async fn main() {
     let result = match cli.command {
         Some(Command::List) => commands::list::execute(&client).await,
         Some(Command::Delete { ref url }) => commands::delete::execute(&client, url).await,
+        Some(Command::Tui) => commands::tui::execute(&client).await,
         None => {
             if let Some(ref url) = cli.url {
                 commands::show::execute(&client, url).await

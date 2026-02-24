@@ -196,6 +196,46 @@ pub async fn get_gist(client: &reqwest::Client, gist_id: &str) -> Result<Gist, C
     })
 }
 
+pub async fn update_gist_file(
+    client: &reqwest::Client,
+    gist_id: &str,
+    filename: &str,
+    content: &str,
+) -> Result<Gist, CliError> {
+    let token = resolve_token()?;
+
+    let mut files = std::collections::HashMap::new();
+    files.insert(
+        filename.to_string(),
+        CreateGistFile {
+            content: content.to_string(),
+        },
+    );
+
+    let body = serde_json::json!({ "files": files });
+
+    let resp = client
+        .patch(format!("{BASE_URL}/gists/{gist_id}"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", "application/vnd.github+json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| CliError::Http {
+            context: "failed to update gist".into(),
+            hint: None,
+            source: e,
+        })?;
+
+    let resp = check_status(resp, "failed to update gist").await?;
+
+    resp.json::<Gist>().await.map_err(|e| CliError::Http {
+        context: "failed to parse update gist response".into(),
+        hint: None,
+        source: e,
+    })
+}
+
 pub async fn delete_gist(client: &reqwest::Client, gist_id: &str) -> Result<(), CliError> {
     let token = resolve_token()?;
 

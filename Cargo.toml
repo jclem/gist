@@ -6,7 +6,7 @@ description = "GitHub Gist CLI"
 
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }
-tokio = { version = "1", features = ["rt", "macros"] }
+tokio = { version = "1", features = ["rt", "macros", "sync"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -14,3 +14,6 @@ thiserror = "2"
 indicatif = "0.18"
 anstream = "0.6"
 anstyle = "1"
+ratatui = "0.29"
+crossterm = "0.28"
+syntect = { version = "5", default-features = false, features = ["default-syntaxes", "default-themes", "parsing", "regex-onig"] }
